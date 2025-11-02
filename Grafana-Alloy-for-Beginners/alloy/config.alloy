@@ -1,0 +1,49 @@
+livedebugging {
+  enabled = true
+}
+
+// This is the config that Alloy will use. We will be filling this out
+// in the hands-on sections and exercises
+logging {
+  format = "logfmt"
+  level = "debug"
+  write_to = [loki.relabel.alloy_logs.receiver]
+}
+
+loki.relabel "alloy_logs"{
+  forward_to = [loki.write.mythical.receiver]
+
+  rule {
+    target_label = "group"
+    replacement = "infrastructure"
+  }
+  rule {
+    target_label = "service"
+    replacement = "alloy"
+  }
+}
+
+loki.write "mythical"{
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}
+
+discovery.http "service_discovery"{
+  url = "http://service-discovery/targets.json"
+  refresh_interval = "2s"
+}
+
+prometheus.scrape "infrastructure"{
+  scrape_interval = "2s"
+  scrape_timeout = "2s"
+
+  targets = discovery.http.service_discovery.targets
+  forward_to = [prometheus.remote_write.mimir.receiver]
+}
+
+prometheus.remote_write "mimir" {
+  endpoint {
+    url = "http://mimir:9009/api/v1/push"
+  }
+}
