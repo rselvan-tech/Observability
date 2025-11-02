@@ -4,6 +4,13 @@ livedebugging {
 
 // This is the config that Alloy will use. We will be filling this out
 // in the hands-on sections and exercises
+
+// Section 1: Build a pipeline for infrastructure logs with Alloy
+// Objectives:
+//          Collect logs from Alloy using the logging block
+//          Use loki.relabel to add labels to the logs
+//          Use loki.write to export logs to Loki
+
 logging {
   format = "logfmt"
   level = "debug"
@@ -29,6 +36,12 @@ loki.write "mythical"{
   }
 }
 
+// Section 2: Build a pipeline for infrastructure metrics with Alloy - Part I
+// Objectives:
+//        Use the discovery.http component to discover the targets to scrape
+//        Scrape the targets' metrics using the prometheus.scrape component
+//        Use the prometheus.remote_write component to export metrics to the locally running Mimir
+
 discovery.http "service_discovery"{
   url = "http://service-discovery/targets.json"
   refresh_interval = "2s"
@@ -46,4 +59,199 @@ prometheus.remote_write "mimir" {
   endpoint {
     url = "http://mimir:9009/api/v1/push"
   }
+}
+
+prometheus.exporter.postgres "mythical" {
+  data_source_names = ["postgresql://postgres:mythical@mythical-database:5432/postgres?sslmode=disable"]
+}
+
+//Section 3 - Build a pipeline for infrastructure metrics with Alloy - Part II ( PostGreSQL )
+//Objectives
+//        Expose metrics from the Postgres DB using the prometheus.exporter.postgres component
+//        Scrape metrics from Postgres using the prometheus.scrape component
+//        Use the prometheus.relabel to add and modify labels
+//        Export metrics to Mimir using the prometheus.remote_write component
+
+prometheus.scrape "postgres"{
+  scrape_interval = "2s"
+  scrape_timeout = "2s"
+
+  targets = prometheus.exporter.postgres.mythical.targets
+  forward_to = [prometheus.relabel.postgres.receiver]
+}
+
+prometheus.relabel "postgres"{
+  forward_to = [prometheus.remote_write.mimir.receiver]
+  rule {
+    target_label = "group"
+    replacement = "infrastructure"
+  }
+  rule {
+    target_label = "service"
+    replacement = "alloy"
+  }
+  rule {
+    action = "replace"
+    target_label = "instance"
+    source_labels = ["instance"]
+    regex = "^postgresql://(.+)"
+    replacement = "$1"
+  }
+}
+
+//Section 4: : Build a pipeline for application metrics with Alloy
+// Objectives : 
+//      Collect application metrics using the prometheus.scrape component
+//      Export metrics to locally running Mimir using the prometheus.write.queue component
+
+prometheus.scrape "mythical" {
+    scrape_interval = "2s"
+    scrape_timeout  = "2s"
+
+    targets = [
+        {"__address__" = "mythical-server:4000", group = "mythical", service = "mythical-server"},
+        {"__address__" = "mythical-requester:4001", group = "mythical", service = "mythical-requester"}, 
+    ]
+
+//    forward_to = [prometheus.write.queue.experimental.receiver]
+    forward_to = [prometheus.remote_write.mimir.receiver]
+
+}
+
+// Below component Generates Error
+// Error: ./alloy/config.alloy:116:1: component "prometheus.write.queue" is at stability level "experimental", 
+// which is below the minimum allowed stability level "generally-available". Use --stability.level command-line flag to enable "experimental" features
+// prometheus.write.queue "experimental" {
+//    endpoint "mimir" {
+//        url = "http://mimir:9009/api/v1/push"
+//    }
+// }
+
+
+// Section 5: Build a pipeline for application traces with Alloy
+// Objectives :
+//      Receive spans using the otelcol.receiver.otlp component
+//      Batch spans using the otelcol.processor.batch component
+//      Export spans using the otelcol.exporter.otlp component
+
+otelcol.receiver.otlp "otlp_receiver" {
+    grpc {
+        endpoint = "0.0.0.0:4317"
+    }
+    http {
+        endpoint = "0.0.0.0:4318"
+    }
+    output {
+        traces = [ otelcol.processor.batch.default.input,
+            otelcol.connector.spanlogs.autologging.input ]
+    }
+}
+
+otelcol.processor.batch "default" {
+    output {
+        traces = [ otelcol.exporter.otlp.tempo.input ]
+    }
+
+    send_batch_size     = 1000
+    send_batch_max_size = 2000
+
+    timeout = "2s"
+}
+
+otelcol.exporter.otlp "tempo" {
+    client {
+        endpoint = "http://tempo:4317"
+
+        // This is a local instance of Tempo, so we can skip TLS verification
+        tls {
+            insecure             = true
+            insecure_skip_verify = true
+        }
+    }
+}
+
+// Section 6: Build a pipeline for application logs with Alloy
+// Objectives :
+//        Ingest application logs using the loki.source.api component
+//        Add labels to logs using the loki.process component
+//        Use stage.regex and stage.timestamp to extract the timestamp from the log lines and set the log’s timestamp
+
+loki.source.api "mythical" {
+    http {
+        listen_address = "0.0.0.0"
+        listen_port    = "3100"
+    }
+    forward_to = [loki.process.mythical.receiver]
+}
+
+loki.process "mythical" {
+    stage.static_labels {
+        values = {
+           service = "mythical",
+        }
+    }
+    stage.regex {
+            expression=`^.*?loggedtime=(?P<loggedtime>\S+)`
+    }
+
+    stage.timestamp {
+        source = "loggedtime"
+        format = "2006-01-02T15:04:05.000Z07:00"
+    }
+
+    forward_to = [loki.write.mythical.receiver]
+}
+
+// Section 7: Generate logs from application traces with Alloy
+// Objectives :
+//        Recieve OTLP spans from app using the otelcol.receiver.otlp component
+//        Convert ingested traces to logs using the otelcol.connector.spanlogs component
+//        Convert the logs to Loki formatted log entries using the otelcol.exporter.loki component
+//        Use the loki.process component to convert the format and add attributes to the logs
+//        Export processed logs to Loki using the loki.write component
+
+
+otelcol.connector.spanlogs "autologging" {
+    roots = true
+    spans = false
+    processes = false
+
+    span_attributes = ["http.method", "http.target", "http.status_code"]
+
+    output {
+        logs = [otelcol.exporter.loki.autologging.input]
+    }
+}
+
+otelcol.exporter.loki "autologging" {
+    forward_to = [loki.process.autologging.receiver]
+}
+
+loki.process "autologging" {
+    stage.json {
+       expressions = {"body" = ""}
+    }
+
+    stage.output {
+       source = "body"
+    }
+
+    stage.logfmt {
+        mapping = {
+            http_method_extracted      = "http.method",
+            http_status_code_extracted = "http.target",
+            http_target_extracted      = "http.status_code",
+
+        }
+    }
+
+    stage.labels {
+        values = {
+            method = "http_method_extracted",
+            status = "http_status_code_extracted",
+            target = "http_target_extracted",
+        }
+    }
+
+    forward_to = [loki.write.mythical.receiver]
 }
